@@ -1,83 +1,104 @@
+"""Чтение публичных Telegram-каналов через веб-превью t.me/s/<канал> — без аккаунта и API-ключей.
+Работает только для публичных каналов, у которых не отключено превью."""
+import asyncio
 from datetime import datetime
 
-from telethon import TelegramClient
-from telethon.errors import RPCError
-from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import ChatInviteAlready, ChatInvitePeek
+import aiohttp
+from bs4 import BeautifulSoup
 
 from models import Post
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
+MAX_PAGES = 10      # по ~20 постов на страницу — до ~200 постов назад
+
 
 class TelegramSource:
-    def __init__(self, api_id: int, api_hash: str, session: str):
-        self.client = TelegramClient(session, api_id, api_hash)
-        self._cache: dict[str, object] = {}
+    def __init__(self):
+        self.session: aiohttp.ClientSession | None = None
 
     async def start(self):
-        await self.client.connect()
-        if not await self.client.is_user_authorized():
-            raise RuntimeError("Telethon-сессия не авторизована. Запусти: python login_telegram.py")
+        self.session = aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30))
 
     async def stop(self):
-        await self.client.disconnect()
+        if self.session:
+            await self.session.close()
 
-    async def _resolve(self, handle: str):
-        if handle in self._cache:
-            return self._cache[handle]
-        try:
-            ent = await self.client.get_entity(handle)
-        except (ValueError, RPCError):
-            # Возможно, это хэш приватной инвайт-ссылки
+    async def _page(self, handle: str, before: int | None) -> str:
+        url = f"https://t.me/s/{handle}" + (f"?before={before}" if before else "")
+        async with self.session.get(url, allow_redirects=False) as r:
+            if r.status in (301, 302):
+                raise RuntimeError("нет веб-превью (канал приватный или превью отключено)")
+            r.raise_for_status()
+            return await r.text()
+
+    @staticmethod
+    def _parse(html: str, handle: str) -> tuple[str, list[Post], int | None]:
+        soup = BeautifulSoup(html, "html.parser")
+        title_el = soup.select_one(".tgme_channel_info_header_title")
+        title = title_el.get_text(strip=True) if title_el else handle
+        posts, ids = [], []
+
+        for msg in soup.select(".tgme_widget_message[data-post]"):
+            data_post = msg["data-post"]                     # "channel/123"
             try:
-                res = await self.client(CheckChatInviteRequest(handle))
-            except RPCError as e:
-                raise RuntimeError(f"канал не найден ({e.__class__.__name__})")
-            if isinstance(res, (ChatInviteAlready, ChatInvitePeek)):
-                ent = res.chat
+                mid = int(data_post.rsplit("/", 1)[1])
+            except ValueError:
+                continue
+            ids.append(mid)
+            if "service_message" in msg.get("class", []):
+                continue
+            t = msg.select_one(".tgme_widget_message_date time[datetime]")
+            if not t:
+                continue
+            date = datetime.fromisoformat(t["datetime"])
+
+            text_el = msg.select_one(".tgme_widget_message_text")
+            if text_el:
+                for br in text_el.find_all("br"):
+                    br.replace_with("\n")
+                text = text_el.get_text()
             else:
-                raise RuntimeError("приватный канал — подпишись на него с аккаунта парсера")
-        self._cache[handle] = ent
-        return ent
+                text = ""
+
+            if msg.select_one(".tgme_widget_message_grouped_wrap"):
+                media = "🖼"
+            elif msg.select_one(".tgme_widget_message_video_player, .tgme_widget_message_roundvideo_player"):
+                media = "🎬"
+            elif msg.select_one(".tgme_widget_message_photo_wrap"):
+                media = "📷"
+            elif msg.select_one(".tgme_widget_message_voice, .tgme_widget_message_audio"):
+                media = "🎧"
+            elif msg.select_one(".tgme_widget_message_poll"):
+                media = "📊"
+            elif msg.select_one(".tgme_widget_message_document"):
+                media = "📎"
+            else:
+                media = ""
+
+            posts.append(Post("tg", handle, title, date, text, f"https://t.me/{data_post}", media))
+
+        if not ids and not soup.select_one(".tgme_channel_info"):
+            raise RuntimeError("канал не найден или без веб-превью")
+        return title, posts, (min(ids) if ids else None)
 
     async def fetch(self, handle: str, since: datetime) -> list[Post]:
-        ent = await self._resolve(handle)
-        title = getattr(ent, "title", None) or handle
-        username = getattr(ent, "username", None)
-        albums: dict[int, Post] = {}
-        posts: list[Post] = []
-
-        # reverse=True + offset_date → сообщения новее указанной даты, от старых к новым
-        async for m in self.client.iter_messages(ent, offset_date=since, reverse=True):
-            if m.date <= since or getattr(m, "action", None):
-                continue
-            text = m.message or ""
-            if m.grouped_id and m.grouped_id in albums:      # альбом: склеиваем в один пост
-                p = albums[m.grouped_id]
-                if text and not p.text:
-                    p.text = text
-                continue
-
-            if username:
-                url = f"https://t.me/{username}/{m.id}"
-            else:
-                url = f"https://t.me/c/{ent.id}/{m.id}"
-
-            media = ""
-            if m.grouped_id:
-                media = "🖼"
-            elif m.photo:
-                media = "📷"
-            elif m.video or m.gif:
-                media = "🎬"
-            elif m.voice or m.audio:
-                media = "🎧"
-            elif m.poll:
-                media = "📊"
-            elif m.document:
-                media = "📎"
-
-            p = Post("tg", handle, title, m.date, text, url, media)
-            if m.grouped_id:
-                albums[m.grouped_id] = p
-            posts.append(p)
-        return posts
+        collected: dict[str, Post] = {}
+        before = None
+        for _ in range(MAX_PAGES):
+            html = await self._page(handle, before)
+            _, posts, oldest_id = self._parse(html, handle)
+            reached_old = False
+            for p in posts:
+                if p.date > since:
+                    collected[p.url] = p
+                else:
+                    reached_old = True
+            if reached_old or not oldest_id or oldest_id <= 1:
+                break
+            before = oldest_id
+            await asyncio.sleep(1)
+        return sorted(collected.values(), key=lambda p: p.date)

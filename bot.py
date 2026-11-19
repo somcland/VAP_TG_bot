@@ -31,8 +31,7 @@ DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "24"))
 PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "300"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
-tg = TelegramSource(int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
-                    os.getenv("TG_SESSION", "parser"))
+tg = TelegramSource()
 ig = InstagramSource(os.getenv("IG_USERNAME") or None, os.getenv("IG_SESSION_FILE") or None)
 
 dp = Dispatcher()
