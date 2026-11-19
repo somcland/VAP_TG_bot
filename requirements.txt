@@ -1,0 +1,4 @@
+aiogram>=3.13
+telethon>=1.36
+instaloader>=4.13
+python-dotenv>=1.0
