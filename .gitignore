@@ -7,3 +7,6 @@ state.tmp
 __pycache__/
 *.pyc
 venv/
+settings.json
+sources.json
+*.tmp
