@@ -1,6 +1,7 @@
 """Чтение публичных Telegram-каналов через веб-превью t.me/s/<канал> — без аккаунта и API-ключей.
 Работает только для публичных каналов, у которых не отключено превью."""
 import asyncio
+import re
 from datetime import datetime
 
 import aiohttp
@@ -13,6 +14,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
+BG_RE = re.compile(r"background-image:\s*url\(['\"]?([^'\")]+)")
 MAX_PAGES = 10      # по ~20 постов на страницу — до ~200 постов назад
 
 
@@ -79,7 +81,14 @@ class TelegramSource:
             else:
                 media = ""
 
-            posts.append(Post("tg", handle, title, date, text, f"https://t.me/{data_post}", media))
+            images = []
+            for el in msg.select(".tgme_widget_message_photo_wrap, .tgme_widget_message_video_thumb, "
+                                 ".tgme_widget_message_link_preview .link_preview_image"):
+                m = BG_RE.search(el.get("style", ""))
+                if m and m.group(1) not in images:
+                    images.append(m.group(1))
+
+            posts.append(Post("tg", handle, title, date, text, f"https://t.me/{data_post}", media, images))
 
         if not ids and not soup.select_one(".tgme_channel_info"):
             raise RuntimeError("канал не найден или без веб-превью")

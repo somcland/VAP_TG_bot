@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, LinkPreviewOptions, Message
 from dotenv import load_dotenv
@@ -28,7 +29,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Astrakhan"))
 DEFAULT_HOURS = int(os.getenv("DEFAULT_HOURS", "24"))
-PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "300"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 tg = TelegramSource()
@@ -136,103 +136,87 @@ async def collect(chat_id: int, forced_since: datetime | None, progress: Message
     return results, errors
 
 
-# ---------- форматирование ----------
+# ---------- форматирование и отправка ----------
 
-EMOJI_RE = re.compile(
-    "[\U0001F000-\U0001FAFF\U0001F1E6-\U0001F1FF☀-➿⬀-⯿"
-    "⌀-⏿️‍⃣]+"
-)
-TITLE_MAX = 90
+CAPTION_MAX = 1024     # лимит подписи к фото в Telegram
+TEXT_MAX = 4096        # лимит обычного сообщения
 
 
-def clean(s: str) -> str:
-    s = EMOJI_RE.sub(" ", s)
-    s = re.sub(r"([!?.])\1{2,}", r"\1", s)          # «!!!» → «!», «....» → «.»
-    return re.sub(r"[ \t]+", " ", s).strip()
+def tidy(s: str) -> str:
+    s = s.replace("\r", "")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
-def split_title(raw: str) -> tuple[str, str]:
-    """Первая строка или первое предложение — заголовок, остальное — текст."""
-    lines = [clean(l) for l in raw.splitlines()]
-    lines = [l for l in lines if l]
-    if not lines:
-        return "", ""
-    # строки без знака препинания в конце склеиваем через точку, чтобы не слипались
-    rest = " ".join(l if re.search(r"[.!?…:;,]$", l) else l + "." for l in lines[1:-1])
-    rest = f"{rest} {lines[-1]}".strip() if len(lines) > 1 else ""
-    first = lines[0]
-    if len(first) > TITLE_MAX:
-        m = re.match(rf"(.{{10,{TITLE_MAX}}}?[.!?…])\s+(.*)", first)
-        if not m:
-            return "", re.sub(r"\s+", " ", f"{first} {rest}").strip()
-        first, rest = m.group(1), f"{m.group(2)} {rest}"
-    return first.rstrip(" .:"), re.sub(r"\s+", " ", rest).strip()
-
-
-def plural(n: int, one: str, few: str, many: str) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return few
-    return many
-
-
-def fmt_post(p: Post) -> str:
-    title, body = split_title(p.text or "")
-    if len(body) > PREVIEW_LEN:
-        body = body[:PREVIEW_LEN].rsplit(" ", 1)[0].rstrip(",;:—- ") + "…"
+def post_parts(p: Post) -> tuple[str, str, str]:
+    """(шапка, текст, подвал) в HTML."""
     when = p.date.astimezone(TZ).strftime("%d.%m · %H:%M")
-    media = f" {p.media}" if p.media else ""
-    meta = f"<code>{when}</code>{media}  ·  <a href=\"{p.url}\">открыть</a>"
-    if not title and not body:
-        return f"{meta}\n<i>без текста</i>"
-    quote = []
-    if title:
-        quote.append(f"<b>{html.escape(title)}</b>")
-    if body:
-        quote.append(html.escape(body))
-    return f"{meta}\n<blockquote>{chr(10).join(quote)}</blockquote>"
+    where = "Telegram" if p.platform == "tg" else "Instagram"
+    head = f"<b>{html.escape(p.source)}</b>\n<i>{when} · {where}</i>"
+    text = html.escape(tidy(p.text or ""))
+    foot = f"<a href=\"{p.url}\">Открыть пост →</a>"
+    return head, text, foot
 
 
-def build_messages(results, errors) -> list[str]:
-    blocks = []
+def visible_len(h: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", h)))
+
+
+def compose(p: Post, limit: int) -> str:
+    head, text, foot = post_parts(p)
+    full = f"{head}\n\n{text}\n\n{foot}" if text else f"{head}\n\n{foot}"
+    if visible_len(full) <= limit:
+        return full
+    # не влезает — режем текст по границе слова (бывает только у очень длинных постов)
+    room = limit - visible_len(f"{head}\n\n…\n\n{foot}")
+    plain = tidy(p.text)[:max(room, 0)].rsplit(" ", 1)[0]
+    return f"{head}\n\n{html.escape(plain)}…\n\n{foot}"
+
+
+def summary(results, errors) -> str:
+    count = sum(len(r[2]) for r in results)
+    out = f"Итого новых постов: <b>{count}</b>"
+    empty = [f"@{h}" for pl, h, ps in results if not ps]
+    if empty:
+        out += f"\nБез новых: {html.escape(', '.join(empty))}"
+    if errors:
+        out += "\n\n⚠️ Ошибки:\n" + "\n".join(html.escape(e) for e in errors)
+    return out
+
+
+def ordered_posts(results) -> list[Post]:
     order = {("tg", h): i for i, h in enumerate(sources.TELEGRAM)}
     order.update({("ig", h): 100 + i for i, h in enumerate(sources.INSTAGRAM)})
     found = sorted((r for r in results if r[2]), key=lambda r: order.get((r[0], r[1]), 999))
-    count = sum(len(r[2]) for r in found)
+    return [p for _, _, posts in found for p in posts]
 
-    for platform, handle, posts in found:
-        where = "Telegram" if platform == "tg" else "Instagram"
-        name = html.escape(posts[0].source)
-        n = len(posts)
-        head = (f"━━━━━━━━━━━━\n<b>{name}</b>\n"
-                f"<i>@{html.escape(handle)} · {where} · {n} {plural(n, 'пост', 'поста', 'постов')}</i>")
-        # заголовок склеиваем с первым постом, чтобы он не оторвался при разбиении
-        items = [fmt_post(p) for p in posts]
-        blocks.append(head + "\n\n" + items[0])
-        blocks.extend(items[1:])
 
-    empty = [f"@{h}" for pl, h, ps in results if not ps]
-    footer = f"Итого новых постов: <b>{count}</b>"
-    if empty:
-        footer += f"\nБез новых: {html.escape(', '.join(empty))}"
-    if errors:
-        footer += "\n\n⚠️ Ошибки:\n" + "\n".join(html.escape(e) for e in errors)
-    blocks.append(footer)
+async def safe(call):
+    """Вызов API с ожиданием при флуд-лимите Telegram."""
+    for _ in range(3):
+        try:
+            return await call()
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
 
-    # склеиваем блоки в сообщения ≤ 4000 символов
-    msgs, cur = [], ""
-    for b in blocks:
-        while len(b) > 4000:                       # очень длинный блок режем по строкам
-            cut = b.rfind("\n", 0, 4000)
-            msgs.append(b[:cut]); b = b[cut + 1:]
-        if len(cur) + len(b) + 2 > 4000:
-            msgs.append(cur); cur = b
-        else:
-            cur = f"{cur}\n\n{b}" if cur else b
-    if cur:
-        msgs.append(cur)
-    return msgs
+
+async def send_post(msg: Message, p: Post):
+    img = p.images[0] if p.images else None
+    if img:
+        cap = compose(p, CAPTION_MAX)
+        try:
+            # полный текст влезает в подпись — фото с подписью
+            if visible_len(cap) == visible_len(compose(p, TEXT_MAX)):
+                return await safe(lambda: msg.answer_photo(img, caption=cap))
+            # текст длинный — сообщение с большой картинкой сверху (через превью ссылки)
+            return await safe(lambda: msg.answer(
+                compose(p, TEXT_MAX),
+                link_preview_options=LinkPreviewOptions(
+                    url=img, prefer_large_media=True, show_above_text=True)))
+        except Exception as e:
+            log.warning("картинка не отправилась (%s): %s", p.url, e)
+    await safe(lambda: msg.answer(compose(p, TEXT_MAX),
+                                  link_preview_options=LinkPreviewOptions(is_disabled=True)))
 
 
 # ---------- хендлеры ----------
@@ -292,8 +276,10 @@ async def run(msg: Message, forced: datetime | None):
             await progress.delete()
         except Exception:
             pass
-        for text in build_messages(results, errors):
-            await msg.answer(text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        for p in ordered_posts(results):
+            await send_post(msg, p)
+            await asyncio.sleep(1.1)          # не больше ~1 сообщения в секунду, иначе флуд-лимит
+        await msg.answer(summary(results, errors))
 
 
 @dp.message(Command("new"))

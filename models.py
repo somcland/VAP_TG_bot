@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -11,3 +11,4 @@ class Post:
     text: str
     url: str
     media: str = ""    # эмодзи-метка типа медиа
+    images: list[str] = field(default_factory=list)  # ссылки на картинки/превью видео

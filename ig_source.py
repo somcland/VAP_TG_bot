@@ -40,8 +40,16 @@ class InstagramSource:
                 media = "🎬"
             else:
                 media = "📷"
+            images = []
+            try:
+                if p.typename == "GraphSidecar":
+                    images = [n.display_url for n in p.get_sidecar_nodes()]
+                else:
+                    images = [p.url]
+            except Exception:
+                pass
             posts.append(Post("ig", handle, title, d, p.caption or "",
-                              f"https://www.instagram.com/p/{p.shortcode}/", media))
+                              f"https://www.instagram.com/p/{p.shortcode}/", media, images))
             if checked > 50:                    # страховка от выкачивания всей ленты
                 break
         posts.sort(key=lambda x: x.date)
