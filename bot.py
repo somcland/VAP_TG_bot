@@ -138,13 +138,60 @@ async def collect(chat_id: int, forced_since: datetime | None, progress: Message
 
 # ---------- форматирование ----------
 
+EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U0001F1E6-\U0001F1FF☀-➿⬀-⯿"
+    "⌀-⏿️‍⃣]+"
+)
+TITLE_MAX = 90
+
+
+def clean(s: str) -> str:
+    s = EMOJI_RE.sub(" ", s)
+    s = re.sub(r"([!?.])\1{2,}", r"\1", s)          # «!!!» → «!», «....» → «.»
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def split_title(raw: str) -> tuple[str, str]:
+    """Первая строка или первое предложение — заголовок, остальное — текст."""
+    lines = [clean(l) for l in raw.splitlines()]
+    lines = [l for l in lines if l]
+    if not lines:
+        return "", ""
+    # строки без знака препинания в конце склеиваем через точку, чтобы не слипались
+    rest = " ".join(l if re.search(r"[.!?…:;,]$", l) else l + "." for l in lines[1:-1])
+    rest = f"{rest} {lines[-1]}".strip() if len(lines) > 1 else ""
+    first = lines[0]
+    if len(first) > TITLE_MAX:
+        m = re.match(rf"(.{{10,{TITLE_MAX}}}?[.!?…])\s+(.*)", first)
+        if not m:
+            return "", re.sub(r"\s+", " ", f"{first} {rest}").strip()
+        first, rest = m.group(1), f"{m.group(2)} {rest}"
+    return first.rstrip(" .:"), re.sub(r"\s+", " ", rest).strip()
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
 def fmt_post(p: Post) -> str:
-    text = re.sub(r"\s+", " ", p.text).strip()
-    if len(text) > PREVIEW_LEN:
-        text = text[:PREVIEW_LEN].rsplit(" ", 1)[0] + "…"
-    when = p.date.astimezone(TZ).strftime("%d.%m %H:%M")
-    body = html.escape(text) if text else "<i>без текста</i>"
-    return f"• <code>{when}</code> {p.media} {body}\n  <a href=\"{p.url}\">открыть →</a>"
+    title, body = split_title(p.text or "")
+    if len(body) > PREVIEW_LEN:
+        body = body[:PREVIEW_LEN].rsplit(" ", 1)[0].rstrip(",;:—- ") + "…"
+    when = p.date.astimezone(TZ).strftime("%d.%m · %H:%M")
+    media = f" {p.media}" if p.media else ""
+    meta = f"<code>{when}</code>{media}  ·  <a href=\"{p.url}\">открыть</a>"
+    if not title and not body:
+        return f"{meta}\n<i>без текста</i>"
+    quote = []
+    if title:
+        quote.append(f"<b>{html.escape(title)}</b>")
+    if body:
+        quote.append(html.escape(body))
+    return f"{meta}\n<blockquote>{chr(10).join(quote)}</blockquote>"
 
 
 def build_messages(results, errors) -> list[str]:
@@ -155,10 +202,15 @@ def build_messages(results, errors) -> list[str]:
     count = sum(len(r[2]) for r in found)
 
     for platform, handle, posts in found:
-        icon = "✈️" if platform == "tg" else "📸"
+        where = "Telegram" if platform == "tg" else "Instagram"
         name = html.escape(posts[0].source)
-        head = f"{icon} <b>{name}</b> · @{html.escape(handle)} — {len(posts)}"
-        blocks.append(head + "\n" + "\n".join(fmt_post(p) for p in posts))
+        n = len(posts)
+        head = (f"━━━━━━━━━━━━\n<b>{name}</b>\n"
+                f"<i>@{html.escape(handle)} · {where} · {n} {plural(n, 'пост', 'поста', 'постов')}</i>")
+        # заголовок склеиваем с первым постом, чтобы он не оторвался при разбиении
+        items = [fmt_post(p) for p in posts]
+        blocks.append(head + "\n\n" + items[0])
+        blocks.extend(items[1:])
 
     empty = [f"@{h}" for pl, h, ps in results if not ps]
     footer = f"Итого новых постов: <b>{count}</b>"
