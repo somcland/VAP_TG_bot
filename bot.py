@@ -11,9 +11,11 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, LinkPreviewOptions, Message
+from aiogram import F
+from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, LinkPreviewOptions, Message)
 from dotenv import load_dotenv
 
 import sources
@@ -138,7 +140,6 @@ async def collect(chat_id: int, forced_since: datetime | None, progress: Message
 
 # ---------- форматирование и отправка ----------
 
-CAPTION_MAX = 1024     # лимит подписи к фото в Telegram
 TEXT_MAX = 4096        # лимит обычного сообщения
 
 
@@ -162,15 +163,17 @@ def visible_len(h: str) -> int:
     return len(html.unescape(re.sub(r"<[^>]+>", "", h)))
 
 
-def compose(p: Post, limit: int) -> str:
+def compose(p: Post, limit: int, with_link: bool = True) -> str:
     head, text, foot = post_parts(p)
-    full = f"{head}\n\n{text}\n\n{foot}" if text else f"{head}\n\n{foot}"
+    if not with_link:
+        foot = ""
+    full = "\n\n".join(x for x in (head, text, foot) if x)
     if visible_len(full) <= limit:
         return full
     # не влезает — режем текст по границе слова (бывает только у очень длинных постов)
     room = limit - visible_len(f"{head}\n\n…\n\n{foot}")
     plain = tidy(p.text)[:max(room, 0)].rsplit(" ", 1)[0]
-    return f"{head}\n\n{html.escape(plain)}…\n\n{foot}"
+    return "\n\n".join(x for x in (head, html.escape(plain) + "…", foot) if x)
 
 
 def summary(results, errors) -> str:
@@ -200,23 +203,71 @@ async def safe(call):
             await asyncio.sleep(e.retry_after + 1)
 
 
-async def send_post(msg: Message, p: Post):
-    img = p.images[0] if p.images else None
-    if img:
-        cap = compose(p, CAPTION_MAX)
-        try:
-            # полный текст влезает в подпись — фото с подписью
-            if visible_len(cap) == visible_len(compose(p, TEXT_MAX)):
-                return await safe(lambda: msg.answer_photo(img, caption=cap))
-            # текст длинный — сообщение с большой картинкой сверху (через превью ссылки)
-            return await safe(lambda: msg.answer(
-                compose(p, TEXT_MAX),
-                link_preview_options=LinkPreviewOptions(
-                    url=img, prefer_large_media=True, show_above_text=True)))
-        except Exception as e:
-            log.warning("картинка не отправилась (%s): %s", p.url, e)
-    await safe(lambda: msg.answer(compose(p, TEXT_MAX),
-                                  link_preview_options=LinkPreviewOptions(is_disabled=True)))
+# ---------- карусель: одно сообщение, листаем кнопками ----------
+
+DIGESTS: dict[int, list[Post]] = {}     # id подборки → посты (живут до перезапуска бота)
+MAX_DIGESTS = 30
+_next_id = 0
+
+
+def store_digest(posts: list[Post]) -> int:
+    global _next_id
+    _next_id += 1
+    DIGESTS[_next_id] = posts
+    while len(DIGESTS) > MAX_DIGESTS:
+        DIGESTS.pop(next(iter(DIGESTS)))
+    return _next_id
+
+
+def slide(d: int, i: int, j: int) -> tuple[str, LinkPreviewOptions, InlineKeyboardMarkup]:
+    posts = DIGESTS[d]
+    p = posts[i]
+    text = compose(p, TEXT_MAX, with_link=False)
+    img = p.images[j] if p.images else None
+    preview = (LinkPreviewOptions(url=img, prefer_large_media=True, show_above_text=True)
+               if img else LinkPreviewOptions(is_disabled=True))
+
+    nav = lambda ii, jj: f"nav:{d}:{ii}:{jj}"
+    n = len(posts)
+    rows = [[
+        InlineKeyboardButton(text="◀", callback_data=nav((i - 1) % n, 0)),
+        InlineKeyboardButton(text=f"{i + 1} / {n}", callback_data="noop"),
+        InlineKeyboardButton(text="▶", callback_data=nav((i + 1) % n, 0)),
+    ]]
+    k = len(p.images)
+    if k > 1:
+        rows.append([
+            InlineKeyboardButton(text="‹ фото", callback_data=nav(i, (j - 1) % k)),
+            InlineKeyboardButton(text=f"🖼 {j + 1} / {k}", callback_data="noop"),
+            InlineKeyboardButton(text="фото ›", callback_data=nav(i, (j + 1) % k)),
+        ])
+    rows.append([InlineKeyboardButton(text="Открыть пост →", url=p.url)])
+    return text, preview, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_carousel(msg: Message, posts: list[Post]):
+    d = store_digest(posts)
+    text, preview, kb = slide(d, 0, 0)
+    await safe(lambda: msg.answer(text, link_preview_options=preview, reply_markup=kb))
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(cq: CallbackQuery):
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("nav:"))
+async def cb_nav(cq: CallbackQuery):
+    _, d, i, j = cq.data.split(":")
+    if int(d) not in DIGESTS:
+        return await cq.answer("Подборка устарела — запроси /new заново", show_alert=True)
+    text, preview, kb = slide(int(d), int(i), int(j))
+    try:
+        await cq.message.edit_text(text, link_preview_options=preview, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            log.warning("edit: %s", e)
+    await cq.answer()
 
 
 # ---------- хендлеры ----------
@@ -276,10 +327,10 @@ async def run(msg: Message, forced: datetime | None):
             await progress.delete()
         except Exception:
             pass
-        for p in ordered_posts(results):
-            await send_post(msg, p)
-            await asyncio.sleep(1.1)          # не больше ~1 сообщения в секунду, иначе флуд-лимит
         await msg.answer(summary(results, errors))
+        posts = ordered_posts(results)
+        if posts:
+            await send_carousel(msg, posts)
 
 
 @dp.message(Command("new"))
